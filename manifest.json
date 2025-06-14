@@ -1,11 +1,11 @@
 {
-	"id": "sample-plugin",
-	"name": "Sample Plugin",
+	"id": "Oraculum-plugin",
+	"name": "Oraculum",
 	"version": "1.0.0",
 	"minAppVersion": "0.15.0",
-	"description": "Demonstrates some of the capabilities of the Obsidian API.",
-	"author": "Obsidian",
-	"authorUrl": "https://obsidian.md",
-	"fundingUrl": "https://obsidian.md/pricing",
+	"description": "AI Powered knowledge assistant to expand your second brain",
+	"author": "Chamalka Muwangala",
+	"authorUrl": "www.linkedin.com/in/chamalka-muwangala-17a24924a",
+	"fundingUrl": "www.linkedin.com/in/chamalka-muwangala-17a24924a",
 	"isDesktopOnly": false
 }

@@ -1,134 +1,176 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { Plugin, Notice, PluginSettingTab, Setting } from 'obsidian';
+import { GoogleGenAI } from '@google/genai';
 
-// Remember to rename these classes and interfaces!
-
-interface MyPluginSettings {
-	mySetting: string;
+interface SummarizeResponse {
+  candidates: { content: string }[];
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+interface Settings {
+  apiKey: string;
+  model: string; // e.g. 'gemini-2.0-flash'
 }
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+const DEFAULT_SETTINGS: Settings = {
+  apiKey: '',
+  model: 'gemini-2.0-flash',
+};
 
-	async onload() {
-		await this.loadSettings();
+export default class InlineSummarizePlugin extends Plugin {
+  settings: Settings;
+  ai!: GoogleGenAI;
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
+  async onload() {
+    // Load persisted settings or defaults
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.ai = new GoogleGenAI({ apiKey: this.settings.apiKey });
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
+    // Add settings tab for API key & model
+    this.addSettingTab(new (class extends PluginSettingTab {
+      plugin: any;
+      display(): void {
+        const { containerEl } = this;
+        containerEl.empty();
+        containerEl.createEl('h2', { text: 'Gemini API Settings' });
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
+        new Setting(containerEl)
+          .setName('API Key')
+          .setDesc('Your Google Generative Language API key')
+          .addText(text =>
+            text
+              .setPlaceholder('Enter API key')
+              .setValue(this.plugin.settings.apiKey)
+              .onChange(async (value) => {
+                this.plugin.settings.apiKey = value;
+                await this.plugin.saveData(this.plugin.settings);
+              })
+          );
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-			}
-		});
+        new Setting(containerEl)
+          .setName('Model')
+          .setDesc('Gemini model, e.g. gemini-2.0-flash')
+          .addText(text =>
+            text
+              .setValue(this.plugin.settings.model)
+              .onChange(async (value) => {
+                this.plugin.settings.model = value;
+                await this.plugin.saveData(this.plugin.settings);
+              })
+          );
+      }
+      constructor(plugin: InlineSummarizePlugin) {
+        super(plugin.app, plugin);
+        (this as any).plugin = plugin;
+      }
+    })(this));
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+    // Summarize Selection
+    this.addCommand({
+      id: 'summarize-selection',
+      name: 'Summarize Selection',
+      editorCallback: (editor) => this.handleEditor(editor, 'short'),
+    });
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
+    // Expand Selection
+    this.addCommand({
+      id: 'expand-selection',
+      name: 'Expand Selection',
+      editorCallback: (editor) => this.handleEditor(editor, 'detailed'),
+    });
 
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-	}
+    this.addCommand({
+      id: 'ask-gemini',
+      name: 'Ask the Oraculum',
+      editorCallback: (editor) => this.askGemini(editor),
+    });
+  }
 
-	onunload() {
+  async handleEditor(editor: import('obsidian').Editor, mode: 'short' | 'detailed') {
+    const text = editor.getSelection();
+    if (!text) { new Notice('Select text first'); return; }
 
-	}
+    // Outline the style prompt so that it can give me a standardized format in the same style that i have
+    const stylePrompt = `Mimic the tone, formatting, and language style of the following text when summarizing or expanding it.`;
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
+    const prompt =
+      mode === 'short'
+        ? `Provide a concise summary of the following text, keeping the existing obsidian links:\n\n${text}`
+        : `Provide a detailed expansion of the following section that has been written:\n\n${text}`;
 
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-}
+     try {
+      const stream = await this.ai.models.generateContentStream({
+        model: this.settings.model,
+        contents: [
+          // System prompt goes first:
+          {
+            text: `You are an AI assistant embedded in Obsidian, the note taking application.  
+            You know about Obsidian’s markdown conventions, backlinks, and editor UX—always respond in valid markdown suitable for Obsidian.
+            Highlight the most important techniques, algorithms and topics in double sqaure brackets so that they can be a sepearte note`,
+          },
+          // Then the actual user prompt:
+          { text: `${stylePrompt}\n\n${prompt}` },
+        ],
+        config: {
+          temperature: 0.5,
+        },
+      });
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
+      editor.replaceSelection('');
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
+      // As each chunk arrives, append it
+      for await (const chunk of stream) {
+        // Gemini stream chunks expose `.text`
+        const piece = chunk.text;
+        if (piece) {
+          editor.replaceSelection(piece);
+        }
+      }
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
+    } catch (e) {
+      console.error(e);
+      new Notice('Error querying the oracle.');
+    }
+  }
 
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
+  async askGemini(editor: import('obsidian').Editor) {
+    const question = editor.getSelection();
+    if (!question) {
+      new Notice('Select a question or prompt first.');
+      return;
+    }
 
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
+    try {
+      const stream = await this.ai.models.generateContentStream({
+        model: this.settings.model,
+        contents: [
+          // Minimal system prompt: no Obsidian-specific tone enforcement
+          {
+            text: `You are an AI assistant embedded in Obsidian, the note taking application.  
+            You know about Obsidian’s markdown conventions, backlinks, and editor UX—always respond in valid markdown suitable for Obsidian.
+            Highlight the most important techniques, algorithms and topics in double sqaure brackets so that they can be a sepearte note`,
+          },
+          { text: question },
+        ],
+        config: {
+          temperature: 0.4,
+        },
+      });
 
-	display(): void {
-		const {containerEl} = this;
+      editor.replaceSelection('');
 
-		containerEl.empty();
+      for await (const chunk of stream) {
+        const piece = chunk.text;
+        if (piece) {
+          editor.replaceSelection(piece);
+        }
+      }
 
-		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
-	}
+    } catch (e) {
+      console.error(e);
+      new Notice('Error calling Gemini.');
+    }
+  }
+
+
+
+  onunload() {}
 }
