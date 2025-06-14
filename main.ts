@@ -15,18 +15,17 @@ const DEFAULT_SETTINGS: Settings = {
   model: 'gemini-2.0-flash',
 };
 
-export default class InlineSummarizePlugin extends Plugin {
+export default class OraculumPlugin extends Plugin {
   settings: Settings;
-  ai!: GoogleGenAI;
+  ai?: GoogleGenAI;
 
   async onload() {
     // Load persisted settings or defaults
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    this.ai = new GoogleGenAI({ apiKey: this.settings.apiKey });
 
     // Add settings tab for API key & model
     this.addSettingTab(new (class extends PluginSettingTab {
-      plugin: any;
+      plugin: OraculumPlugin;
       display(): void {
         const { containerEl } = this;
         containerEl.empty();
@@ -42,6 +41,7 @@ export default class InlineSummarizePlugin extends Plugin {
               .onChange(async (value) => {
                 this.plugin.settings.apiKey = value;
                 await this.plugin.saveData(this.plugin.settings);
+                this.plugin.initializeAi();
               })
           );
 
@@ -57,34 +57,54 @@ export default class InlineSummarizePlugin extends Plugin {
               })
           );
       }
-      constructor(plugin: InlineSummarizePlugin) {
+      constructor(plugin: OraculumPlugin) {
         super(plugin.app, plugin);
         (this as any).plugin = plugin;
       }
     })(this));
-
+    
+    this.initializeAi();
+    
     // Summarize Selection
     this.addCommand({
       id: 'summarize-selection',
       name: 'Summarize Selection',
       editorCallback: (editor) => this.handleEditor(editor, 'short'),
     });
-
     // Expand Selection
     this.addCommand({
       id: 'expand-selection',
       name: 'Expand Selection',
       editorCallback: (editor) => this.handleEditor(editor, 'detailed'),
     });
-
     this.addCommand({
       id: 'ask-gemini',
       name: 'Ask the Oraculum',
       editorCallback: (editor) => this.askGemini(editor),
-    });
+    });   
   }
 
+  initializeAi(): void {
+    if (!this.settings.apiKey) {
+      this.ai = undefined;
+      new Notice('⚠️ Please enter your API key in plugin settings.');
+      return;
+    }
+    try {
+      this.ai = new GoogleGenAI({ apiKey: this.settings.apiKey });
+    } catch (e) {
+      console.error('GenAI init failed:', e);
+      this.ai = undefined;
+      new Notice('❌ Invalid API key—please re-enter it.');
+    }
+  }
+  
   async handleEditor(editor: import('obsidian').Editor, mode: 'short' | 'detailed') {
+    if (!this.ai) {
+      new Notice('No API key set – open Settings and paste your key.');
+      return;
+    }
+
     const text = editor.getSelection();
     if (!text) { new Notice('Select text first'); return; }
 
@@ -97,7 +117,8 @@ export default class InlineSummarizePlugin extends Plugin {
         : `Provide a detailed expansion of the following section that has been written:\n\n${text}`;
 
      try {
-      const stream = await this.ai.models.generateContentStream({
+      const ai = this.ai;
+      const stream = await ai.models.generateContentStream({
         model: this.settings.model,
         contents: [
           // System prompt goes first:
@@ -132,6 +153,10 @@ export default class InlineSummarizePlugin extends Plugin {
   }
 
   async askGemini(editor: import('obsidian').Editor) {
+    if (!this.ai) {
+      new Notice('No API key set – open Settings and paste your key.');
+      return;
+    }
     const question = editor.getSelection();
     if (!question) {
       new Notice('Select a question or prompt first.');
@@ -139,7 +164,8 @@ export default class InlineSummarizePlugin extends Plugin {
     }
 
     try {
-      const stream = await this.ai.models.generateContentStream({
+      const ai = this.ai;
+      const stream = await ai.models.generateContentStream({
         model: this.settings.model,
         contents: [
           // Minimal system prompt: no Obsidian-specific tone enforcement
