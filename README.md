@@ -11,16 +11,16 @@ Oraculum is your AI-powered assistant inside Obsidian, designed to help you writ
 - Generate a clear, link-aware summary of the text you’ve highlighted, preserving your Obsidian backlinks.
 
 **Expand Selection**
-- Flesh out an idea or section with richer detail, examples, and [[wikilinks]]—perfect for brainstorming or deepening explanations.
+- Flesh out an idea or section with richer detail, examples, and [[wikilinks]], perfect for brainstorming or deepening explanations.
 
 **Create Note from Title**
-- Turn a file’s title into a full-fledged note skeleton, complete with headings, bullet points, and suggested links.
+- Uses a file’s title to create a full-fledged note skeleton, complete with headings, bullet points, and suggested links. If done on a note with existing tags, it preserves them.
 
 **Suggest Tags for Current Note**
 - Automatically generate up to five concise front-matter tags based on your note’s content.
 
 **Semantic Related Notes** (**Still under development**)
-Appends a ## Related Notes section to your note, ranking the top 3 closest notes by cosine similarity.
+- Appends a ## Related Notes section to your note, ranking the top 3 closest notes by cosine similarity.
 
 ## Installation
 
