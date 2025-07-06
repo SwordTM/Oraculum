@@ -27,6 +27,7 @@
 		"vite": "^6.3.5"
 	},
 	"dependencies": {
+		"node-fetch": "^3.3.2",
 		"p-queue": "^8.1.0"
 	}
 }

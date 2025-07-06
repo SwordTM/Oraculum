@@ -1,4 +1,9 @@
-import { Plugin, Notice, PluginSettingTab, Setting, Modal, App, MarkdownView, TFile} from 'obsidian';
+import fetch, { Headers, Request, Response } from 'node-fetch';
+(globalThis as any).fetch   = fetch;
+(globalThis as any).Headers = Headers;
+(globalThis as any).Request = Request;
+(globalThis as any).Response= Response;
+import { Plugin, Notice, PluginSettingTab, Setting, Modal, App, MarkdownView, requestUrl, TFile} from 'obsidian';
 import { GoogleGenAI } from '@google/genai';
 import cosineSimilarity from 'cosine-similarity';
 import PQueue from 'p-queue';
@@ -24,7 +29,7 @@ const DEFAULT_SETTINGS: Settings = {
   apiKey: '',
   model: 'gemini-2.0-flash',
   hfToken: '',
-  embedModel: 'sentence-transformers/all-MiniLM-L6-v2'
+  embedModel: 'models/gemini-embedding-exp-03-07'
 };
 
 export default class OraculumPlugin extends Plugin {
@@ -41,20 +46,27 @@ export default class OraculumPlugin extends Plugin {
     this.ai = new GoogleGenAI({ apiKey: this.settings.apiKey });
     this.index = (await this.loadData())?.embeddings || {};
 
+    const modelName = this.settings.embedModel;
+    console.log("▶️ embedding with model:", modelName);
+
     this.embedQueue = new PQueue({
       concurrency: 1,           // one batch at a time
-      intervalCap: 13,          // <=10 tasks per interval
+      intervalCap: 140,          // <=10 tasks per interval
       interval: 60_000,         // 60 000 ms = 1 minute
       carryoverConcurrencyCount: true
     });
 
     this.buildEmbeddingIndex(13);
 
-    // Also re-queue any single-file updates:
     this.registerEvent(
-      this.app.vault.on('modify', (file) => {
+      this.app.workspace.on('file-open', async (file) => {
         if (file instanceof TFile && file.extension === 'md') {
-          this.embedQueue.add(() => this.indexFileEmbedding(file));
+          try {
+            await this.indexFileEmbedding(file);
+            console.log(`[Oraculum] Embedded on open: ${file.path}`);
+          } catch (e) {
+            console.error(`[Oraculum] Embed-on-open failed:`, e);
+          }
         }
       })
     );
@@ -152,59 +164,10 @@ export default class OraculumPlugin extends Plugin {
         this.addCommand({
           id: 'expand-from-title',
           name: 'Create Note from Title',
-          callback: async () => {
-            const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
-            if (!mdView || !mdView.file) {
-              new Notice("No note is open right now");
-              return;
-            }
-
-            const file = mdView.file;
-            const title = file.basename;
-
-            if (!this.ai) {
-              new Notice("AI not initialized – set your API key first.");
-              return;
-            }
-
-            const prompt = `Write a comprehensive Obsidian-style note titled "${title}". 
-            The note should be informative, use markdown formatting, include bullet points or headings where useful, and use [[wikilinks]] for key terms or ideas that could be their own notes. `;
-
-            try {
-              const stream = await this.ai.models.generateContentStream({
-                model: this.settings.model,
-                contents: [
-                  {
-                    text: `You are an AI assistant embedded in Obsidian. Write markdown notes suitable for the Obsidian vault environment. 
-                    Avoid the initial markdown tag. Avoid putting the note title in the content`,
-                  },
-                  { text: prompt },
-                ],
-                config: {
-                  temperature: 0.5,
-                },
-              });
-
-              // Replace current note content
-              const editor = mdView.editor;
-              editor.setValue(''); // or comment this line to append instead
-              for await (const chunk of stream) {
-                if (chunk.text) editor.replaceSelection(chunk.text);
-              }
-
-              new Notice(`✅ "${title}" expanded from title`);
-
-              await this.ensureIndexed(file);
-
-            } catch (e) {
-              console.error('Failed to expand note:', e);
-              new Notice('❌ Failed to generate content from title');
-            }
-          }
+          callback: () => this.createNoteFromTitle()
         });
 
         await this.embedQueue.onIdle();
-        console.log("✅ All backfill embeddings are done!", Object.keys(this.index));
   }
 
   initializeAi(): void {
@@ -224,8 +187,7 @@ export default class OraculumPlugin extends Plugin {
 
   getRelated(currentPath: string, topK = 5) {
     console.log('[Oraculum:getRelated] 🔍 called for:', currentPath);
-    console.log('[Oraculum:getRelated] this.index keys:', Object.keys(this.index));
-    console.log('[Oraculum:getRelated] index keys:', Object.keys(this.index));
+    console.log('[Oraculum:getRelated] index size:', Object.keys(this.index).length);
 
     const currEmbedding = this.index[currentPath]?.embedding;
     if (!currEmbedding) {
@@ -292,17 +254,16 @@ Return your answer as a comma-separated list (no '#' prefix), e.g. Ai, Ethics, P
 Give only unique tags, no duplicates
 `;
     try {
-      const stream = await this.ai.models.generateContentStream({
+      const resp = await this.ai.models.generateContent({
         model: this.settings.model,
         contents: [{ text: prompt }],
         config: { temperature: 0.1 },
       });
       // Accumulate every chunk.text into one raw string
-      let raw = '';
-      for await (const chunk of stream) {
-        if (chunk.text) {
-          raw += chunk.text;
-        }
+      const raw = resp.text ?? resp.candidates?.[0]?.content;
+      if (typeof raw !== 'string' || raw.trim() === '') {
+        new Notice('⚠️ No tags returned from the AI');
+        return;
       }
 
       // Now parse out up to five “#tag” tokens
@@ -384,65 +345,97 @@ Give only unique tags, no duplicates
         stale.push(f);
       }
     }
+    console.log(`[Oraculum] 🔍 buildEmbeddingIndex found ${stale.length} files to embed`);
     
     for (let i = 0; i < stale.length; i += BATCH) {
       const batch = stale.slice(i, i + BATCH);
+      console.log(`[Oraculum] ➕ queueing batch ${i/BATCH + 1} (${batch.length} files)`);
       this.embedQueue.add(() => this.indexBatch(batch));
     }
     await this.embedQueue.onIdle();
-    // this.syncNoteIndex();
+    console.log("[Oraculum] 🛑 buildEmbeddingIndex: all batches finished");
     await this.saveData({ ...this.settings, embeddings: this.index });
     new Notice('✅ Initial embedding index complete');
   }
 
-  private async indexBatch(files: TFile[]) {
-    const texts = await Promise.all(files.map(f => this.app.vault.read(f)));
-    const paths = files.map(f => f.path);
-    const mtimes = await Promise.all(files.map(f => this.app.vault.adapter.stat(f.path).then(s => s!.mtime)));
+  private async indexBatch(files: TFile[], attempt = 0) {
+    console.log(`[Oraculum] ▶️ indexBatch start (${files.length} files), attempt #${attempt}`);
     try {
-      const resp = await this.ai!.models.embedContent({
-        model: this.settings.embedModel,
-        contents: texts,
-      });
-      resp.embeddings?.forEach((embObj, i) => {
-        // extract the vector from its `.values` field
-        const vector = (embObj as any).values as number[];
-        this.index[paths[i]] = { mtime: mtimes[i], embedding: vector };
-      });
-    
-      await this.saveData({ ...this.settings, embeddings: this.index });
-    } catch (e) {
-      console.error('Batch embed failed:', e);
+      for (const file of files) {
+        await this.indexFileEmbedding(file);
+      }
+      console.log(`[Oraculum] ✔️ indexBatch succeeded for ${files.length} files`);
+    } catch (err : any) {
+      if ((err.status === 429 || err.message.includes("exhausted")) && attempt < 5) {
+        const backoff = Math.min(60000, 1000 * 2 ** attempt);
+        setTimeout(() =>
+          this.embedQueue.add(() => this.indexBatch(files, attempt + 1))
+        , backoff);
+        return;
+      }
+      console.error("Batch embed failed:", err);
     }
   }
 
   private async indexFileEmbedding(file: TFile) {
-    const stat = await this.app.vault.adapter.stat(file.path);
-    if (this.index[file.path]?.mtime === stat!.mtime) {
-      return;
-    }
-    const text = await this.app.vault.read(file);
-
+    console.log(`[Oraculum] ✏️ indexFileEmbedding: ${file.path}`);
     try {
-      // 4. Call the embeddings API for this single document
+      const stat = await this.app.vault.adapter.stat(file.path);
+      if (this.index[file.path]?.mtime === stat!.mtime) {
+        return;
+      }
+      const text = await this.app.vault.read(file);
       const resp = await this.ai!.models.embedContent({
         model: this.settings.embedModel,
         contents: text,
       });
-      const embeddingObj = resp.embeddings![0];
 
-      const vector = (embeddingObj as any).values as number[];
+  
+      const raw = resp.embeddings;
+      if (!raw || raw.length === 0) {
+        throw new Error("No embeddings returned for single file");
+      }
+      const first = raw[0];
+      let vector: number[];
+      if (Array.isArray(first)) {
+        vector = first;
+      } else if (Array.isArray((first as any).values)) {
+        vector = (first as any).values as number[];
+      } else if ((first as any).embedding && Array.isArray((first as any).embedding.values)) {
+        vector = (first as any).embedding.values as number[];
+      } else {
+        throw new Error("Unable to extract vector from embedding object");
+      }
 
       this.index[file.path] = { mtime: stat!.mtime, embedding: vector };
-
-      // 6. Persist the updated index to disk
-      await this.saveData({
-        ...this.settings,
-        embeddings: this.index,
-      });
+      await this.saveData({ ...this.settings, embeddings: this.index });
     } catch (e) {
       console.error(`Embed failed for ${file.path}:`, e);
     }
+  }
+
+  /**
+   * “Type out” `fullText` into the given editor, one chunk at a time.
+   * @param editor   The CodeMirror editor instance
+   * @param fullText The complete response string
+   * @param delayMs  How many milliseconds between each chunk
+   * @param chunkSize How many characters per chunk
+   */
+  private simulateTyping(
+    editor: import('obsidian').Editor,
+    fullText: string,
+    delayMs = 20,
+    chunkSize = 1
+  ) {
+    let offset = 0;
+    const insertNext = () => {
+      if (offset >= fullText.length) return;
+      const slice = fullText.substr(offset, chunkSize);
+      editor.replaceSelection(slice);
+      offset += chunkSize;
+      setTimeout(insertNext, delayMs);
+    };
+    insertNext();
   }
 
   async handleEditor(editor: import('obsidian').Editor, mode: 'short' | 'detailed') {
@@ -464,7 +457,7 @@ Give only unique tags, no duplicates
 
      try {
       const ai = this.ai;
-      const stream = await ai.models.generateContentStream({
+      const resp = await ai.models.generateContent({
         model: this.settings.model,
         contents: [
           // System prompt goes first:
@@ -482,16 +475,16 @@ Give only unique tags, no duplicates
         },
       });
 
+      const fullText = resp.text 
+        ?? resp.candidates?.[0]?.content;
+      if (typeof fullText !== 'string') {
+        new Notice('⚠️ No content returned to type out');
+        return;
+      }
+
       editor.replaceSelection('');
 
-      // As each chunk arrives, append it
-      for await (const chunk of stream) {
-        // Gemini stream chunks expose `.text`
-        const piece = chunk.text;
-        if (piece) {
-          editor.replaceSelection(piece);
-        }
-      }
+      this.simulateTyping(editor, fullText, 25, 30);
 
       const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
       if (!mdView?.file) return;
@@ -516,7 +509,7 @@ Give only unique tags, no duplicates
 
     try {
       const ai = this.ai;
-      const stream = await ai.models.generateContentStream({
+      const resp = await ai.models.generateContent({
         model: this.settings.model,
         contents: [
           // Minimal system prompt: no Obsidian-specific tone enforcement
@@ -533,14 +526,16 @@ Give only unique tags, no duplicates
         },
       });
 
+      const fullText = resp.text 
+        ?? resp.candidates?.[0]?.content;
+      if (typeof fullText !== 'string') {
+        new Notice('⚠️ No content returned to type out');
+        return;
+      }
+
       editor.replaceSelection('');
 
-      for await (const chunk of stream) {
-        const piece = chunk.text;
-        if (piece) {
-          editor.replaceSelection(piece);
-        }
-      }
+      this.simulateTyping(editor, fullText, 25, 30);
 
       const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
       if (!mdView?.file) return;
@@ -552,25 +547,60 @@ Give only unique tags, no duplicates
     }
   }
 
-  private async ensureIndexed(file: TFile) {
-  // Full build once
-  if (Object.keys(this.index).length === 0) {
-    new Notice("🔄 Building full‐vault embeddings…");
-    await this.buildEmbeddingIndex(13);
-    new Notice("✅ Vault embeddings ready.");
+  private async createNoteFromTitle() {
+    const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!mdView?.file) {
+      new Notice("No note is open right now");
+      return;
+    }
+    const file   = mdView.file;
+    const editor = mdView.editor;
+    const title  = file.basename;
+
+    if (!this.ai) {
+      new Notice("AI not initialized – set your API key first.");
+      return;
+    }
+
+    const prompt = `Write a comprehensive Obsidian-style note titled "${title}". 
+  The note should be informative, use markdown formatting, include bullet points or headings where useful, and use [[wikilinks]] for key terms or ideas that could be their own notes. 
+  If there is existing content (tags or text), just add to it. Do not remove it completely`;
+
+    try {
+      const resp = await this.ai.models.generateContent({
+        model: this.settings.model,
+        contents: [
+          { text: "You are an AI assistant embedded in Obsidian. Write markdown notes suitable for the Obsidian vault environment. Avoid the initial markdown tag. Avoid putting the note title in the content" },
+          { text: prompt }
+        ],
+        config: { temperature: 0.5 },
+      });
+
+      const fullText = resp.text ?? resp.candidates?.[0]?.content;
+      if (typeof fullText !== 'string') {
+        new Notice('⚠️ No content returned to type out');
+        return;
+      }
+
+      editor.replaceSelection('');
+      this.simulateTyping(editor, fullText, 25, 30);
+      new Notice(`✅ "${title}" expanded from title`);
+
+      await this.ensureIndexed(file);
+    } catch (e) {
+      console.error('Failed to expand note:', e);
+      new Notice('❌ Failed to generate content from title');
+    }
   }
 
-  // Per‐file upsert if missing or stale
-  const stat = await this.app.vault.adapter.stat(file.path);
-  const existing = this.index[file.path];
-  if (!existing || existing.mtime < stat!.mtime) {
-    await this.indexFileEmbedding(file);
-    new Notice(`✅ Re‐embedded ${file.name}.`);
-    // Backfill everything else at ≤10/min
-    this.queueAllOtherEmbeddings(file.path);
-    new Notice("🕒 Queued other notes for embedding (≤10/min).");
+
+  private async ensureIndexed(file: TFile) {
+    const stat = await this.app.vault.adapter.stat(file.path);
+    const existing = this.index[file.path];
+    if (!existing || existing.mtime < stat!.mtime) {
+      await this.indexFileEmbedding(file);
+    }
   }
-}
 
   onunload() {}
 }
