@@ -21,6 +21,7 @@ interface Settings {
 interface EmbeddingIndexEntry {
   mtime: number;
   embedding: number[];
+  hash?: string;
 }
 
 const VAULT_ROOT = process.cwd();
@@ -51,12 +52,12 @@ export default class OraculumPlugin extends Plugin {
 
     this.embedQueue = new PQueue({
       concurrency: 1,           // one batch at a time
-      intervalCap: 140,          // <=10 tasks per interval
+      intervalCap: 10,          // <=13 tasks per interval
       interval: 60_000,         // 60 000 ms = 1 minute
-      carryoverConcurrencyCount: true
+      carryoverConcurrencyCount: false
     });
 
-    this.buildEmbeddingIndex(13);
+    this.buildEmbeddingIndex(10);
 
     this.registerEvent(
       this.app.workspace.on('file-open', async (file) => {
@@ -157,7 +158,7 @@ export default class OraculumPlugin extends Plugin {
     
         this.addCommand({
           id: 'show-related-notes',
-          name: 'Show Semantic Related Notes (Ctrl+Shift+L)',
+          name: 'Show Semantic Related Notes',
           callback: () => this.handleShowRelatedNotes(13)
         });
 
@@ -303,6 +304,13 @@ Give only unique tags, no duplicates
     }
   }
 
+  async hashText(text: string): Promise<string> {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(text);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
   private async upsertRelatedSection(file: TFile, related: { path: string; score: number }[]) {
     // 1. Read the existing file
     let content = await this.app.vault.read(file);
@@ -385,11 +393,18 @@ Give only unique tags, no duplicates
         return;
       }
       const text = await this.app.vault.read(file);
+      const contentHash = await this.hashText(text);
+
+      const existing = this.index[file.path];
+      if (existing?.mtime === stat!.mtime && existing.hash === contentHash) {
+        console.log(`[Oraculum] ⏩ Skipping unchanged file: ${file.path}`);
+        return;
+      }
+
       const resp = await this.ai!.models.embedContent({
         model: this.settings.embedModel,
         contents: text,
       });
-
   
       const raw = resp.embeddings;
       if (!raw || raw.length === 0) {
@@ -407,7 +422,7 @@ Give only unique tags, no duplicates
         throw new Error("Unable to extract vector from embedding object");
       }
 
-      this.index[file.path] = { mtime: stat!.mtime, embedding: vector };
+      this.index[file.path] = { mtime: stat!.mtime, embedding: vector, hash: contentHash};
       await this.saveData({ ...this.settings, embeddings: this.index });
     } catch (e) {
       console.error(`Embed failed for ${file.path}:`, e);
