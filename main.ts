@@ -57,7 +57,13 @@ export default class OraculumPlugin extends Plugin {
       carryoverConcurrencyCount: false
     });
 
-    this.buildEmbeddingIndex(10);
+    this.queueAllOtherEmbeddings();
+
+    // If there’s already an open MD file, embed it first
+    const active = this.app.workspace.getActiveFile();
+    if (active instanceof TFile && active.extension === 'md') {
+      this.embedQueue.add(() => this.indexFileEmbedding(active));
+    }
 
     this.registerEvent(
       this.app.workspace.on('file-open', async (file) => {
@@ -168,7 +174,7 @@ export default class OraculumPlugin extends Plugin {
           callback: () => this.createNoteFromTitle()
         });
 
-        await this.embedQueue.onIdle();
+        //await this.embedQueue.onIdle();
   }
 
   initializeAi(): void {
@@ -217,19 +223,11 @@ export default class OraculumPlugin extends Plugin {
     }
     const file = mdView.file;
 
-    // ensure the vault index exists
-    if (Object.keys(this.index).length === 0) {
-      new Notice("🔄 Building embeddings for all notes…");
-      await this.buildEmbeddingIndex(13);
-      new Notice("✅ Embedding complete.");
-    }
+    await this.indexFileEmbedding(file);
 
-    // embed this note if needed
-    if (!this.index[file.path]) {
-      await this.indexFileEmbedding(file);
-      new Notice("✅ Embedded current note.");
+    if (Object.keys(this.index).length < this.app.vault.getMarkdownFiles().length) {
       this.queueAllOtherEmbeddings(file.path);
-      new Notice("🕒 Queued other notes for embedding (≤10/min).");
+      new Notice("🕒 Indexing remaining notes in background…");
     }
     
     const related = this.getRelated(file.path);
@@ -334,55 +332,10 @@ Give only unique tags, no duplicates
 
   private queueAllOtherEmbeddings(skipPath?: string) {
     const allFiles = this.app.vault.getMarkdownFiles();
-    const toEmbed = allFiles.filter(f =>
-      f.path !== skipPath &&        // don’t re-embed current
-      !this.index[f.path]           // only files not yet in the index
-    );
-    console.log(`[Oraculum] ▶️ Queuing ${toEmbed.length} other files for embedding…`);
-    toEmbed.forEach(f =>
-      this.embedQueue.add(() => this.indexFileEmbedding(f))
-    );
-  }
-
-  private async buildEmbeddingIndex(BATCH: number) {
-    const files = this.app.vault.getMarkdownFiles();
-    const stale: TFile[] = [];
-    for (const f of files) {
-      const stat = await this.app.vault.adapter.stat(f.path);
-      if (!this.index[f.path] || this.index[f.path].mtime !== stat!.mtime) {
-        stale.push(f);
-      }
-    }
-    console.log(`[Oraculum] 🔍 buildEmbeddingIndex found ${stale.length} files to embed`);
-    
-    for (let i = 0; i < stale.length; i += BATCH) {
-      const batch = stale.slice(i, i + BATCH);
-      console.log(`[Oraculum] ➕ queueing batch ${i/BATCH + 1} (${batch.length} files)`);
-      this.embedQueue.add(() => this.indexBatch(batch));
-    }
-    await this.embedQueue.onIdle();
-    console.log("[Oraculum] 🛑 buildEmbeddingIndex: all batches finished");
-    await this.saveData({ ...this.settings, embeddings: this.index });
-    new Notice('✅ Initial embedding index complete');
-  }
-
-  private async indexBatch(files: TFile[], attempt = 0) {
-    console.log(`[Oraculum] ▶️ indexBatch start (${files.length} files), attempt #${attempt}`);
-    try {
-      for (const file of files) {
-        await this.indexFileEmbedding(file);
-      }
-      console.log(`[Oraculum] ✔️ indexBatch succeeded for ${files.length} files`);
-    } catch (err : any) {
-      if ((err.status === 429 || err.message.includes("exhausted")) && attempt < 5) {
-        const backoff = Math.min(60000, 1000 * 2 ** attempt);
-        setTimeout(() =>
-          this.embedQueue.add(() => this.indexBatch(files, attempt + 1))
-        , backoff);
-        return;
-      }
-      console.error("Batch embed failed:", err);
-    }
+    console.log(`[Oraculum] ▶️ Queuing ${allFiles.length - (skipPath ? 1 : 0)} files for embedding…`);
+    allFiles
+    .filter(f => f.path !== skipPath)
+    .forEach(f => this.embedQueue.add(() => this.indexFileEmbedding(f)));
   }
 
   private async indexFileEmbedding(file: TFile) {
